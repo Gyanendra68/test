@@ -23,11 +23,22 @@ type TranslationCache = {
   translations: Partial<Record<Exclude<SupportedTranslationLanguage, 'en'>, Record<string, string>>>;
 };
 
-const CACHE_FILE = path.resolve('data', 'translations-cache-v2.json');
+type MyMemoryResponse = {
+  responseData?: { translatedText?: string };
+  responseStatus?: number;
+  responseDetails?: string;
+  quotaFinished?: boolean;
+};
+
+const CACHE_FILE = process.env.TRANSLATION_CACHE_FILE
+  ? path.resolve(process.env.TRANSLATION_CACHE_FILE)
+  : path.resolve('data', 'translations-cache-v2.json');
+
 const REQUEST_TIMEOUT_MS = 8000;
 const FAILURE_COOLDOWN_MS = 30000;
 const MAX_CONCURRENT_REQUESTS = 3;
 const MAX_TEXT_LENGTH = 1000;
+const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL?.trim();
 
 const pendingRequests = new Map<string, Promise<string>>();
 const failedUntil = new Map<string, number>();
@@ -68,6 +79,7 @@ function ensureCacheLoaded(): TranslationCache {
       !parsed.translations ||
       typeof parsed.translations !== 'object'
     ) {
+      console.warn('[Translation] Invalid cache format; starting with an empty v2 cache.');
       cache = createEmptyCache();
       return cache;
     }
@@ -78,7 +90,7 @@ function ensureCacheLoaded(): TranslationCache {
       translations: parsed.translations
     };
   } catch (error) {
-    console.error('[Translation] Failed to read v2 cache; starting empty:', error);
+    console.error('[Translation] Cache read failed; starting empty:', error);
     cache = createEmptyCache();
   }
 
@@ -90,15 +102,25 @@ function persistCache(): void {
 
   try {
     fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
-    const temporaryFile = `${CACHE_FILE}.tmp`;
-    fs.writeFileSync(temporaryFile, JSON.stringify(currentCache, null, 2), 'utf8');
+
+    const temporaryFile = `${CACHE_FILE}.${process.pid}.tmp`;
+
+    fs.writeFileSync(
+      temporaryFile,
+      JSON.stringify(currentCache, null, 2),
+      'utf8'
+    );
+
     fs.renameSync(temporaryFile, CACHE_FILE);
   } catch (error) {
-    console.error('[Translation] Failed to persist v2 cache:', error);
+    console.error('[Translation] Cache write failed:', error);
   }
 }
 
-function cacheKey(text: string, language: Exclude<SupportedTranslationLanguage, 'en'>): string {
+function cacheKey(
+  text: string,
+  language: Exclude<SupportedTranslationLanguage, 'en'>
+): string {
   return `en:${language}:${text}`;
 }
 
@@ -115,8 +137,10 @@ function setCachedTranslation(
   translatedText: string
 ): void {
   const currentCache = ensureCacheLoaded();
+
   currentCache.translations[language] ??= {};
   currentCache.translations[language]![text] = translatedText;
+
   persistCache();
 }
 
@@ -125,27 +149,65 @@ async function requestFromMyMemory(
   language: Exclude<SupportedTranslationLanguage, 'en'>
 ): Promise<string> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    REQUEST_TIMEOUT_MS
+  );
 
   try {
-    const url = new URL('https://api.mymemory.translated.net/get');
+    const url = new URL('https://api.mymemory.translated.net/get' );
+
     url.searchParams.set('q', text);
     url.searchParams.set('langpair', `en|${language}`);
 
-    const response = await fetch(url, { signal: controller.signal });
+    if (MYMEMORY_EMAIL) {
+      url.searchParams.set('de', MYMEMORY_EMAIL);
+    }
+
+    console.info(
+      `[Translation] MyMemory request started for ${language}.`
+    );
+
+    const response = await fetch(url, {
+      signal: controller.signal
+    });
+
     if (!response.ok) {
-      throw new Error(`MyMemory returned HTTP ${response.status}`);
+      throw new Error(
+        `MyMemory returned HTTP ${response.status}`
+      );
     }
 
-    const payload = await response.json() as {
-      responseData?: { translatedText?: string };
-      responseStatus?: number;
-    };
+    let payload: MyMemoryResponse;
 
-    const translatedText = payload.responseData?.translatedText?.trim();
-    if (!translatedText || payload.responseStatus === 429) {
-      throw new Error('MyMemory returned no usable translation');
+    try {
+      payload = await response.json() as MyMemoryResponse;
+    } catch {
+      throw new Error(
+        'MyMemory returned malformed JSON'
+      );
     }
+
+    const translatedText =
+      payload.responseData?.translatedText?.trim();
+
+    if (
+      !translatedText ||
+      payload.responseStatus !== 200 ||
+      payload.quotaFinished === true
+    ) {
+      throw new Error(
+        `MyMemory returned no usable translation ` +
+        `(status=${payload.responseStatus ?? 'unknown'}, ` +
+        `quotaFinished=${payload.quotaFinished ?? 'unknown'}, ` +
+        `details=${payload.responseDetails ?? 'none'})`
+      );
+    }
+
+    console.info(
+      `[Translation] MyMemory response received for ${language}.`
+    );
 
     return translatedText;
   } finally {
@@ -154,8 +216,12 @@ async function requestFromMyMemory(
 }
 
 function processQueue(): void {
-  while (activeRequests < MAX_CONCURRENT_REQUESTS && queue.length > 0) {
+  while (
+    activeRequests < MAX_CONCURRENT_REQUESTS &&
+    queue.length > 0
+  ) {
     const item = queue.shift();
+
     if (!item) return;
 
     activeRequests += 1;
@@ -163,11 +229,21 @@ function processQueue(): void {
     requestFromMyMemory(item.text, item.language)
       .then((translatedText) => {
         failedUntil.delete(item.key);
-        setCachedTranslation(item.text, item.language, translatedText);
+
+        setCachedTranslation(
+          item.text,
+          item.language,
+          translatedText
+        );
+
         item.resolve(translatedText);
       })
       .catch((error) => {
-        failedUntil.set(item.key, Date.now() + FAILURE_COOLDOWN_MS);
+        failedUntil.set(
+          item.key,
+          Date.now() + FAILURE_COOLDOWN_MS
+        );
+
         item.reject(error);
       })
       .finally(() => {
@@ -178,8 +254,25 @@ function processQueue(): void {
   }
 }
 
-export function isSupportedTranslationLanguage(value: string): value is SupportedTranslationLanguage {
-  return ['en', 'hi', 'bn', 'te', 'mr', 'ta', 'gu', 'kn', 'ml', 'pa', 'or', 'as', 'ne', 'ur'].includes(value);
+export function isSupportedTranslationLanguage(
+  value: string
+): value is SupportedTranslationLanguage {
+  return [
+    'en',
+    'hi',
+    'bn',
+    'te',
+    'mr',
+    'ta',
+    'gu',
+    'kn',
+    'ml',
+    'pa',
+    'or',
+    'as',
+    'ne',
+    'ur'
+  ].includes(value);
 }
 
 export async function translateText(
@@ -189,47 +282,95 @@ export async function translateText(
   const normalizedText = text.trim();
 
   if (!normalizedText || language === 'en') {
-    return { text, cached: true };
+    return {
+      text,
+      cached: true
+    };
   }
 
   if (normalizedText.length > MAX_TEXT_LENGTH) {
-    return { text, cached: false };
+    return {
+      text,
+      cached: false
+    };
   }
 
-  const targetLanguage = language as Exclude<SupportedTranslationLanguage, 'en'>;
-  const cachedTranslation = getCachedTranslation(normalizedText, targetLanguage);
+  const targetLanguage =
+    language as Exclude<SupportedTranslationLanguage, 'en'>;
+
+  const cachedTranslation = getCachedTranslation(
+    normalizedText,
+    targetLanguage
+  );
 
   if (cachedTranslation) {
-    return { text: cachedTranslation, cached: true };
+    console.info(
+      `[Translation] Cache hit for ${targetLanguage}.`
+    );
+
+    return {
+      text: cachedTranslation,
+      cached: true
+    };
   }
 
-  const key = cacheKey(normalizedText, targetLanguage);
+  const key = cacheKey(
+    normalizedText,
+    targetLanguage
+  );
+
   const existingRequest = pendingRequests.get(key);
+
   if (existingRequest) {
-    return { text: await existingRequest, cached: false };
+    return {
+      text: await existingRequest,
+      cached: false
+    };
   }
 
-  if ((failedUntil.get(key) || 0) > Date.now()) {
-    return { text, cached: false };
+  if (
+    (failedUntil.get(key) || 0) > Date.now()
+  ) {
+    return {
+      text,
+      cached: false
+    };
   }
 
-  const request = new Promise<string>((resolve, reject) => {
-    queue.push({
-      key,
-      text: normalizedText,
-      language: targetLanguage,
-      resolve,
-      reject
-    });
-    processQueue();
-  });
+  console.info(
+    `[Translation] Cache miss for ${targetLanguage}.`
+  );
+
+  const request = new Promise<string>(
+    (resolve, reject) => {
+      queue.push({
+        key,
+        text: normalizedText,
+        language: targetLanguage,
+        resolve,
+        reject
+      });
+    }
+  );
 
   pendingRequests.set(key, request);
+  processQueue();
 
   try {
-    return { text: await request, cached: false };
+    return {
+      text: await request,
+      cached: false
+    };
   } catch (error) {
-    console.error(`[Translation] MyMemory request failed for ${targetLanguage}:`, error);
-    return { text, cached: false };
+    console.error(
+      `[Translation] MyMemory request failed for ${targetLanguage}; ` +
+      `using English fallback:`,
+      error
+    );
+
+    return {
+      text,
+      cached: false
+    };
   }
 }
