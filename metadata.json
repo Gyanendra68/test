@@ -1,0 +1,6 @@
+{
+  "name": "TribalScholar",
+  "description": "Unified Scholarship Platform for Tribal Students - Ministry of Tribal Affairs, Government of India",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

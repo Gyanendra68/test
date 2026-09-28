@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b3c5d" />
+      <stop offset="100%" stop-color="#082b42" />
+    </linearGradient>
+    <linearGradient id="gold-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffb300" />
+      <stop offset="100%" stop-color="#f57c00" />
+    </linearGradient>
+    <linearGradient id="tri-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2e7d32" />
+      <stop offset="100%" stop-color="#1b5e20" />
+    </linearGradient>
+  </defs>
+
+  <!-- Circular Base -->
+  <circle cx="256" cy="256" r="248" fill="url(#bg-grad)" stroke="#ffb300" stroke-width="12" />
+
+  <!-- Outer Traditional Tribal Geometrical Ring Pattern -->
+  <g stroke="#ffb300" stroke-width="3" fill="none" opacity="0.6">
+    <circle cx="256" cy="256" r="230" />
+    <circle cx="256" cy="256" r="218" />
+  </g>
+
+  <!-- Radiating Sun / Knowledge Rays -->
+  <g fill="none" stroke="#ffb300" stroke-width="4" stroke-linecap="round" opacity="0.8">
+    <line x1="256" y1="52" x2="256" y2="76" />
+    <line x1="256" y1="436" x2="256" y2="460" />
+    <line x1="52" y1="256" x2="76" y2="256" />
+    <line x1="436" y1="256" x2="460" y2="256" />
+    <line x1="112" y1="112" x2="128" y2="128" />
+    <line x1="384" y1="384" x2="400" y2="400" />
+    <line x1="112" y1="400" x2="128" y2="384" />
+    <line x1="384" y1="128" x2="400" y2="112" />
+  </g>
+
+  <!-- Open Book of Wisdom -->
+  <path d="M 120 330 C 180 300 230 320 256 340 C 282 320 332 300 392 330 L 392 240 C 332 210 282 230 256 250 C 230 230 180 210 120 240 Z" fill="#ffffff" />
+  <path d="M 256 250 L 256 340" stroke="#0b3c5d" stroke-width="4" />
+
+  <!-- Tribal Bow & Arrow & Sun Motif (Symbolizing Empowerment & Aim) -->
+  <path d="M 170 190 Q 256 120 342 190" fill="none" stroke="url(#gold-grad)" stroke-width="12" stroke-linecap="round" />
+  <polygon points="256,110 244,140 268,140" fill="#f57c00" />
+  <line x1="256" y1="130" x2="256" y2="230" stroke="#f57c00" stroke-width="6" stroke-linecap="round" />
+
+  <!-- Graduation Cap (Education) -->
+  <polygon points="256,160 176,195 256,230 336,195" fill="url(#gold-grad)" />
+  <polygon points="216,215 216,250 256,268 296,250 296,215 256,232" fill="#e65100" />
+  <path d="M 336 195 L 348 245" stroke="#ffffff" stroke-width="3" stroke-linecap="round" />
+  <circle cx="348" cy="248" r="5" fill="#ffffff" />
+
+  <!-- Central Seal Emblem Ring -->
+  <circle cx="256" cy="256" r="160" fill="none" stroke="#2e7d32" stroke-width="4" stroke-dasharray="8 6" />
+
+  <!-- Text Arc: TRIBAL SCHOLAR -->
+  <text x="256" y="380" font-family="system-ui, -apple-system, sans-serif" font-weight="900" font-size="28" fill="#ffb300" text-anchor="middle" letter-spacing="4">TRIBAL SCHOLAR</text>
+  <text x="256" y="408" font-family="system-ui, -apple-system, sans-serif" font-weight="600" font-size="14" fill="#a5d6a7" text-anchor="middle" letter-spacing="2">MINISTRY OF TRIBAL AFFAIRS</text>
+  <text x="256" y="426" font-family="system-ui, -apple-system, sans-serif" font-weight="500" font-size="12" fill="#ffffff" text-anchor="middle" letter-spacing="1">GOVERNMENT OF INDIA</text>
+</svg>
