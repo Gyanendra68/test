@@ -1,308 +1,354 @@
-import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
-
-export type Language = 'en' | 'hi' | 'pa' | 'bn' | 'te' | 'mr' | 'ta' | 'gu' | 'kn' | 'ml';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useRef
+} from 'react';
+import {
+  Language,
+  TranslationDictionary,
+  englishTranslations,
+  supportedLanguages
+} from '../i18n/translations';
 
 interface LanguageContextType {
   lang: Language;
   setLang: (lang: Language) => void;
-  t: (text: string) => string;
+  t: TranslationDictionary;
+  translateText: (text: string) => Promise<string>;
 }
+
+type FrontendTranslationQueueItem = {
+  key: string;
+  text: string;
+  language: Exclude<Language, 'en'>;
+  resolve: (value: string) => void;
+};
+
+const MAX_FRONTEND_CONCURRENT_TRANSLATIONS = 3;
+const FRONTEND_FAILURE_COOLDOWN_MS = 30000;
 
 const LanguageContext = createContext<LanguageContextType | undefined>(undefined);
 
-export const LANGUAGES: { code: Language; name: string; nativeName: string }[] = [
-  { code: 'en', name: 'English', nativeName: 'English' },
-  { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी' },
-  { code: 'pa', name: 'Punjabi', nativeName: 'ਪੰਜਾਬੀ' },
-  { code: 'bn', name: 'Bengali', nativeName: 'বাংলা' },
-  { code: 'te', name: 'Telugu', nativeName: 'తెలుగు' },
-  { code: 'mr', name: 'Marathi', nativeName: 'मराठी' },
-  { code: 'ta', name: 'Tamil', nativeName: 'தமிழ்' },
-  { code: 'gu', name: 'Gujarati', nativeName: 'ગુજરાતી' },
-  { code: 'kn', name: 'Kannada', nativeName: 'ಕನ್ನಡ' },
-  { code: 'ml', name: 'Malayalam', nativeName: 'മലയാളം' },
-];
-
-const PROTECTED_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEXTAREA', 'INPUT', 'SELECT', 'OPTION', 'PRE', 'CODE']);
-
-function shouldSkipNode(node: Node): boolean {
-  if (node.nodeType !== Node.TEXT_NODE) return true;
-  const parent = node.parentElement;
-  if (!parent) return true;
-  
-  if (PROTECTED_TAGS.has(parent.tagName)) return true;
-  if (parent.closest('svg')) return true;
-  if (parent.closest('[aria-hidden="true"]')) return true;
-  if (parent.closest('[data-no-translate]')) return true;
-
-  const text = node.nodeValue?.trim();
-  if (!text || /^\d+$/.test(text) \vert{}\vert{} /^[\s\p{P}]+$/u.test(text)) return true;
-
-  return false;
-}
-
 export const LanguageProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [lang, setLangState] = useState<Language>(() => {
-    return (localStorage.getItem('tribal_scholar_lang') as Language) || 'en';
+    const saved = localStorage.getItem('tribal_lang') as Language | null;
+    return saved && supportedLanguages.some((item) => item.code === saved) ? saved : 'en';
   });
 
-  const langRef = useRef<Language>(lang);
-  langRef.current = lang;
+  const currentLanguage = useRef<Language>(lang);
+  currentLanguage.current = lang;
 
-  const originalTextByNode = useRef<Map<Node, string>>(new Map());
-  const translationCache = useRef<Map<string, string>>(new Map());
-  const pendingTranslations = useRef<Map<string, Promise<string>>>(new Map());
-  const translatingNodes = useRef<WeakSet<Node>>(new WeakSet());
-  
-  const isTranslatingRef = useRef<boolean>(false);
-  const pendingRescanRef = useRef<boolean>(false);
-  const translationRunId = useRef<number>(0);
-  const mutationTimeoutRef = useRef<number | null>(null);
+  const originalTextByNode = useRef(new WeakMap<Text, string>());
+  const trackedTextNodes = useRef(new Set<Text>());
+  const pendingTranslations = useRef(new Map<string, Promise<string>>());
+  const resolvedTranslations = useRef(new Map<string, string>());
+  const failedTranslationUntil = useRef(new Map<string, number>());
+  const frontendQueue = useRef<FrontendTranslationQueueItem[]>([]);
+  const activeFrontendTranslations = useRef(0);
+  const processFrontendQueueRef = useRef<() => void>(() => undefined);
+  const translationRunId = useRef(0);
+  const translationRunActive = useRef(false);
+  const translationRerunRequested = useRef(false);
+  const translationRerunTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const t = useCallback((text: string): string => {
-    if (!text) return text;
-    if (lang === 'en') return text;
-    const trimmed = text.trim();
-    if (!trimmed) return text;
-    const cacheKey = `${lang}:${trimmed}`;
-    return translationCache.current.get(cacheKey) || text;
-  }, [lang]);
+  const setLang = (newLang: Language) => {
+    if (newLang === currentLanguage.current) return;
+    currentLanguage.current = newLang;
+    setLangState(newLang);
+    localStorage.setItem('tribal_lang', newLang);
+  };
 
-  const translateTexts = useCallback(async (texts: string[], currentRunId: number, targetLang: Language): Promise<Map<string, string>> => {
-    const results = new Map<string, string>();
-    const uniqueToFetch: string[] = [];
+  const t = englishTranslations;
 
-    for (const text of texts) {
-      if (translationRunId.current !== currentRunId || langRef.current !== targetLang) break;
-      const cacheKey = `${targetLang}:${text}`;
-      if (translationCache.current.has(cacheKey)) {
-        results.set(text, translationCache.current.get(cacheKey)!);
-      } else {
-        uniqueToFetch.push(text);
+  const processFrontendQueue = useCallback(() => {
+    while (
+      activeFrontendTranslations.current < MAX_FRONTEND_CONCURRENT_TRANSLATIONS &&
+      frontendQueue.current.length > 0
+    ) {
+      const item = frontendQueue.current.shift();
+      if (!item) return;
+
+      if (item.language !== currentLanguage.current) {
+        pendingTranslations.current.delete(item.key);
+        item.resolve(item.text);
+        continue;
       }
+
+      activeFrontendTranslations.current += 1;
+
+      fetch('/api/translate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: item.text, language: item.language })
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error(`Translation endpoint returned HTTP ${response.status}`);
+          }
+
+          const payload = await response.json() as { text?: string };
+          const translatedText = typeof payload.text === 'string' && payload.text
+            ? payload.text
+            : item.text;
+
+          if (translatedText === item.text) {
+            failedTranslationUntil.current.set(
+              item.key,
+              Date.now() + FRONTEND_FAILURE_COOLDOWN_MS
+            );
+          } else {
+            resolvedTranslations.current.set(item.key, translatedText);
+            failedTranslationUntil.current.delete(item.key);
+          }
+
+          item.resolve(translatedText);
+        })
+        .catch(() => {
+          failedTranslationUntil.current.set(
+            item.key,
+            Date.now() + FRONTEND_FAILURE_COOLDOWN_MS
+          );
+          item.resolve(item.text);
+        })
+        .finally(() => {
+          activeFrontendTranslations.current -= 1;
+          pendingTranslations.current.delete(item.key);
+          processFrontendQueueRef.current();
+        });
     }
-
-    if (uniqueToFetch.length === 0 || translationRunId.current !== currentRunId) return results;
-
-    const CONCURRENCY = 3;
-    let index = 0;
-
-    const worker = async () => {
-      while (index < uniqueToFetch.length) {
-        if (translationRunId.current !== currentRunId || langRef.current !== targetLang) break;
-        const text = uniqueToFetch[index++];
-        const cacheKey = `${targetLang}:${text}`;
-
-        if (translationCache.current.has(cacheKey)) {
-          results.set(text, translationCache.current.get(cacheKey)!);
-          continue;
-        }
-
-        try {
-          let promise = pendingTranslations.current.get(cacheKey);
-          if (!promise) {
-            promise = fetch('/api/translate', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ text, targetLang }),
-            })
-              .then(async (res) => {
-                if (!res.ok) {
-                  return text;
-                }
-                const data = await res.json();
-                return data.translatedText || text;
-              })
-              .catch(() => text)
-              .finally(() => {
-                pendingTranslations.current.delete(cacheKey);
-              });
-            pendingTranslations.current.set(cacheKey, promise);
-          }
-
-          const translated = await promise;
-          if (translationRunId.current === currentRunId && langRef.current === targetLang) {
-            translationCache.current.set(cacheKey, translated);
-            results.set(text, translated);
-          }
-        } catch {
-          results.set(text, text);
-        }
-      }
-    };
-
-    const workers = Array.from({ length: Math.min(CONCURRENCY, uniqueToFetch.length) }, () => worker());
-    await Promise.all(workers);
-
-    return results;
   }, []);
 
-  const scanAndTranslateDom = useCallback(async (currentRunId: number, targetLang: Language) => {
-    if (targetLang === 'en' || translationRunId.current !== currentRunId) return;
-    isTranslatingRef.current = true;
+  processFrontendQueueRef.current = processFrontendQueue;
 
-    try {
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
-        acceptNode: (node) => (shouldSkipNode(node) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
-      });
+  const translateText = useCallback(async (text: string): Promise<string> => {
+    const normalizedText = text.trim();
+    const targetLanguage = currentLanguage.current;
 
-      const textNodes: Text[] = [];
-      let currentNode: Node | null;
-      while ((currentNode = walker.nextNode())) {
-        textNodes.push(currentNode as Text);
-      }
+    if (targetLanguage === 'en' || !normalizedText) return text;
 
-      if (translationRunId.current !== currentRunId) return;
+    const key = `${targetLanguage}:${normalizedText}`;
+    const resolved = resolvedTranslations.current.get(key);
+    if (resolved) return resolved;
 
-      const nodesBySource = new Map<string, Text[]>();
-      const sourcesToTranslate: string[] = [];
-
-      for (const node of textNodes) {
-        if (!originalTextByNode.current.has(node)) {
-          const raw = node.nodeValue || '';
-          originalTextByNode.current.set(node, raw);
-        }
-
-        const original = originalTextByNode.current.get(node) || '';
-        const trimmed = original.trim();
-        if (!trimmed) continue;
-
-        if (!nodesBySource.has(trimmed)) {
-          nodesBySource.set(trimmed, []);
-          sourcesToTranslate.push(trimmed);
-        }
-        nodesBySource.get(trimmed)!.push(node);
-      }
-
-      if (sourcesToTranslate.length === 0 || translationRunId.current !== currentRunId) return;
-
-      const translations = await translateTexts(sourcesToTranslate, currentRunId, targetLang);
-
-      if (translationRunId.current !== currentRunId) return;
-
-      for (const [source, translatedText] of translations.entries()) {
-        const nodes = nodesBySource.get(source);
-        if (!nodes) continue;
-
-        const prefixMatch = (originalTextByNode.current.get(nodes[0]) || '').match(/^(\s*)/);
-        const suffixMatch = (originalTextByNode.current.get(nodes[0]) || '').match(/(\s*)$/);
-        const finalText = (prefixMatch ? prefixMatch[1] : '') + translatedText + (suffixMatch ? suffixMatch[1] : '');
-
-        for (const node of nodes) {
-          if (node.isConnected && translationRunId.current === currentRunId) {
-            translatingNodes.current.add(node);
-            node.nodeValue = finalText;
-            setTimeout(() => {
-              translatingNodes.current.delete(node);
-            }, 100);
-          }
-        }
-      }
-    } finally {
-      isTranslatingRef.current = false;
-      if (pendingRescanRef.current && translationRunId.current === currentRunId && langRef.current === targetLang) {
-        pendingRescanRef.current = false;
-        setTimeout(() => {
-          if (translationRunId.current === currentRunId && langRef.current === targetLang) {
-            scanAndTranslateDom(currentRunId, targetLang);
-          }
-        }, 150);
-      }
+    if ((failedTranslationUntil.current.get(key) || 0) > Date.now()) {
+      return text;
     }
-  }, [translateTexts]);
 
-  const handleLanguageChange = useCallback((newLang: Language) => {
-    translationRunId.current++;
-    const currentRunId = translationRunId.current;
+    const pending = pendingTranslations.current.get(key);
+    if (pending) return pending;
 
-    setLangState(newLang);
-    localStorage.setItem('tribal_scholar_lang', newLang);
-    langRef.current = newLang;
+    const language = targetLanguage as Exclude<Language, 'en'>;
+    let resolveRequest: (value: string) => void = () => undefined;
+    const request = new Promise<string>((resolve) => {
+      resolveRequest = resolve;
+    });
 
-    if (newLang === 'en') {
-      isTranslatingRef.current = false;
-      pendingRescanRef.current = false;
-      for (const [node, originalText] of originalTextByNode.current.entries()) {
-        if (node.isConnected) {
-          translatingNodes.current.add(node);
-          node.nodeValue = originalText;
-          setTimeout(() => translatingNodes.current.delete(node), 100);
+    pendingTranslations.current.set(key, request);
+    frontendQueue.current.push({
+      key,
+      text: normalizedText,
+      language,
+      resolve: resolveRequest
+    });
+    processFrontendQueueRef.current();
+
+    return request;
+  }, []);
+
+  useEffect(() => {
+    const runId = ++translationRunId.current;
+    let cancelled = false;
+    let observer: MutationObserver;
+
+    const restoreOriginalText = () => {
+      trackedTextNodes.current.forEach((textNode) => {
+        const source = originalTextByNode.current.get(textNode);
+        if (source !== undefined && textNode.isConnected) {
+          textNode.nodeValue = source;
         }
-      }
-      originalTextByNode.current.clear();
+      });
+      trackedTextNodes.current.clear();
+    };
+
+    if (lang === 'en') {
+      restoreOriginalText();
       return;
     }
 
-    scanAndTranslateDom(currentRunId, newLang);
-  }, [scanAndTranslateDom]);
+    const ignoredTags = new Set([
+      'SCRIPT',
+      'STYLE',
+      'NOSCRIPT',
+      'TEXTAREA',
+      'INPUT',
+      'SELECT',
+      'OPTION',
+      'PRE',
+      'CODE'
+    ]);
 
-  useEffect(() => {
-    if (lang === 'en') return;
+    const protectedTokens = new Set([
+      'J',
+      'JAGO',
+      'MoTA',
+      'DigiLocker',
+      'APAAR',
+      'UIDAI',
+      'PFMS',
+      'ST',
+      'PVTG'
+    ]);
 
-    translationRunId.current++;
-    const currentRunId = translationRunId.current;
-    scanAndTranslateDom(currentRunId, lang);
+    const isCurrentRun = () => (
+      !cancelled &&
+      runId === translationRunId.current &&
+      lang === currentLanguage.current
+    );
 
-    const observer = new MutationObserver((mutations) => {
-      let hasRelevantMutation = false;
-      for (const mutation of mutations) {
-        if (mutation.type === 'characterData') {
-          if (mutation.target && translatingNodes.current.has(mutation.target)) {
-            continue;
-          }
-          hasRelevantMutation = true;
-        } else if (mutation.type === 'childList') {
-          for (const node of Array.from(mutation.addedNodes)) {
-            if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.TEXT_NODE) {
-              hasRelevantMutation = true;
-              break;
-            }
-          }
-        }
-        if (hasRelevantMutation) break;
+    const translateVisibleText = async () => {
+      if (!isCurrentRun()) return;
+
+      if (translationRunActive.current) {
+        translationRerunRequested.current = true;
+        return;
       }
 
-      if (!hasRelevantMutation) return;
+      translationRunActive.current = true;
 
-      if (mutationTimeoutRef.current) {
-        window.clearTimeout(mutationTimeoutRef.current);
+      const walker = document.createTreeWalker(
+        document.body,
+        NodeFilter.SHOW_TEXT
+      );
+      const nodesBySource = new Map<string, Text[]>();
+      let currentNode: Node | null;
+
+      while ((currentNode = walker.nextNode())) {
+        const textNode = currentNode as Text;
+        const parent = textNode.parentElement;
+        const value = textNode.nodeValue || '';
+        const trimmed = value.trim();
+
+        if (
+          !parent ||
+          !trimmed ||
+          ignoredTags.has(parent.tagName) ||
+          parent.closest('svg, [aria-hidden="true"], [data-no-translate]')
+        ) {
+          continue;
+        }
+
+        if (
+          protectedTokens.has(trimmed) ||
+          (/^[A-Z0-9][A-Z0-9 .&/+-]{1,24}$/.test(trimmed) && !/\s/.test(trimmed))
+        ) {
+          continue;
+        }
+
+        if (/^(https?:\/\/|mailto:|tel:|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,})/i.test(trimmed)) {
+          continue;
+        }
+
+        if (/^[\d\s.,:/#%+()₹$€£-]+$/.test(trimmed)) {
+          continue;
+        }
+
+        if (!originalTextByNode.current.has(textNode)) {
+          originalTextByNode.current.set(textNode, value);
+        }
+
+        trackedTextNodes.current.add(textNode);
+        const source = originalTextByNode.current.get(textNode) || value;
+        const sourceText = source.trim();
+        const nodes = nodesBySource.get(sourceText) || [];
+        nodes.push(textNode);
+        nodesBySource.set(sourceText, nodes);
       }
 
-      mutationTimeoutRef.current = window.setTimeout(() => {
-        if (langRef.current === 'en') return;
-        if (isTranslatingRef.current) {
-          pendingRescanRef.current = true;
-        } else {
-          scanAndTranslateDom(translationRunId.current, langRef.current);
-        }
-      }, 300);
-    });
+      const uniqueSources = Array.from(nodesBySource.entries());
+      let nextSourceIndex = 0;
 
+      const worker = async () => {
+        while (nextSourceIndex < uniqueSources.length && isCurrentRun()) {
+          const currentIndex = nextSourceIndex;
+          nextSourceIndex += 1;
+
+          const [sourceText, textNodes] = uniqueSources[currentIndex];
+          const translated = await translateText(sourceText);
+
+          if (!isCurrentRun()) return;
+
+          if (translated !== sourceText) {
+            textNodes.forEach((textNode) => {
+              const source = originalTextByNode.current.get(textNode) || textNode.nodeValue || '';
+              if (textNode.isConnected && textNode.nodeValue?.trim() !== translated) {
+                textNode.nodeValue = source.replace(source.trim(), translated);
+              }
+            });
+          }
+        }
+      };
+
+      try {
+        await Promise.all(
+          Array.from(
+            { length: Math.min(MAX_FRONTEND_CONCURRENT_TRANSLATIONS, uniqueSources.length) },
+            () => worker()
+          )
+        );
+      } finally {
+        translationRunActive.current = false;
+
+        if (isCurrentRun()) {
+          if (translationRerunRequested.current) {
+            translationRerunRequested.current = false;
+            translationRerunTimer.current = setTimeout(
+              () => void translateVisibleText(),
+              0
+            );
+          }
+        }
+      }
+    };
+
+    observer = new MutationObserver(() => void translateVisibleText());
     observer.observe(document.body, {
       childList: true,
       subtree: true,
-      characterData: true,
+      characterData: true
     });
 
+    void translateVisibleText();
+
     return () => {
+      cancelled = true;
       observer.disconnect();
-      if (mutationTimeoutRef.current) {
-        window.clearTimeout(mutationTimeoutRef.current);
+      translationRunId.current += 1;
+      translationRunActive.current = false;
+
+      if (translationRerunTimer.current) {
+        clearTimeout(translationRerunTimer.current);
+        translationRerunTimer.current = null;
       }
+
+      translationRerunRequested.current = false;
+      restoreOriginalText();
     };
-  }, [lang, scanAndTranslateDom]);
+  }, [lang, translateText]);
 
   return (
-    <LanguageContext.Provider value={{ lang, setLang: handleLanguageChange, t }}>
+    <LanguageContext.Provider value={{ lang, setLang, t, translateText }}>
       {children}
     </LanguageContext.Provider>
   );
 };
 
-export const useLanguage = () => {
+export function useLanguage() {
   const context = useContext(LanguageContext);
   if (!context) {
     throw new Error('useLanguage must be used within a LanguageProvider');
   }
   return context;
-};
+}
